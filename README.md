@@ -63,6 +63,7 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 | 备份保留天数 | 7 天 | 过期即删；`0` = 永久保留 |
 | 演练模式 | 关 | 只写日志，不移动也不删除 |
 | 开机对账 | 开 | 启动时扫描孤儿快照并写报告 |
+| 开机清理残留绑定 | 开 | 启动时删掉 `index.db` 里指向已删会话的 `kv_store` 绑定（须赶在 bili 的 lane 启动之前） |
 | 自动清理孤儿 | 关 | 对账发现孤儿就直接清理 |
 | 开机延迟 | 8000 ms | 开机对账前等待多久 |
 
@@ -70,6 +71,23 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 
 「恢复最近备份 / 删除全部备份 / 立即备份 cost-meter 账本」三个字段是触发器：**填入一个新数字
 并保存**就执行一次（DSH 的表单没有按钮，只能这样表达动作）。
+
+## bili 索引里究竟删了什么
+
+`index.db` 不是一张表，删干净一个会话要同时处理四类引用：
+
+- **行**：`messages` / `message_media` / `refs` / `blocks` / `dead_refs` / `checkpoints`
+  （只删非 pinned 的）/ `ccr_entries` / `session_ext` / `conversations` / `sessions`
+- **`content` 的引用计数**：每个被删掉的 `content_hash` / `media_hash` / `summary_hash` /
+  `one_hash` / `state_hash` 都要把 `refcount` 减一。不减的话 blob 永远停在 `refcount > 0`，
+  孤儿清扫永远看不到它——真实环境里就是这么攒出几百行「没人引用但删不掉」的泄漏
+- **JSON blob**：`kv_store` 里的 `plugin-conversations/table` 与 `prefix-affinity/v1` 用会话 id
+  做键，按 `session_id` 列删表的做法碰不到它们，会留下一条面板看不见的绑定
+
+最后一项有个时序坑：bili 的 lane 进程把整张会话表放在内存里，**每处理一个请求就整表覆盖一次
+`kv_store`**。所以删除当时清掉的绑定，几秒后会被写回内存里的旧值。真正有效的窗口是
+**lane 启动之前**——开机清扫就是抢这个窗口：删掉指向不存在会话的绑定，lane 起来时读到的
+已经是干净的表。
 
 ## 备份与恢复
 

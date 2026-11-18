@@ -70,6 +70,7 @@ Nothing to configure. By default it does two things: removes the bili JSON snaps
 | Backup retention | 7 days | Older batches are removed on the next start; `0` keeps them forever |
 | Dry run | off | Logs what would happen, moves and deletes nothing |
 | Reconcile on boot | on | Scans for orphan snapshots at startup and writes a report |
+| Sweep stale bindings on boot | on | Drops `kv_store` bindings that point at sessions the index no longer has, before bili's lane starts |
 | Auto purge orphans | off | Cleans orphans found during reconcile instead of only reporting |
 | Boot delay | 8000 ms | How long to wait before reconciling |
 
@@ -79,6 +80,26 @@ Changes take effect immediately, no restart needed.
 The three fields **Restore latest backup / Delete all backups / Back up the cost-meter ledger
 now** are triggers: **write a new number and save** to run the action once. DSH renders schema
 fields, not buttons, so bumping a number is how an action is expressed.
+
+## What "deleting from the index" actually covers
+
+`index.db` is not one table. Removing a session takes four kinds of references:
+
+- **Rows**: `messages` / `message_media` / `refs` / `blocks` / `dead_refs` / `checkpoints`
+  (non-pinned only) / `ccr_entries` / `session_ext` / `conversations` / `sessions`
+- **`content` refcounts**: every `content_hash` / `media_hash` / `summary_hash` / `one_hash` /
+  `state_hash` that belonged to the session has to lose one reference. Skip this and the blob
+  stays pinned at `refcount > 0` forever, invisible to the orphan sweep — that is exactly how a
+  real database accumulated hundreds of rows nobody could collect
+- **JSON blobs**: `plugin-conversations/table` and `prefix-affinity/v1` in `kv_store` are keyed
+  by session id, so a `WHERE session_id = ?` delete never reaches them and a binding survives
+  that the panel does not show
+
+The last one has a timing trap: bili's lane keeps the whole conversation table in memory and
+**rewrites `kv_store` from memory on every request**, so a binding removed during the purge is
+back within seconds. The window that actually holds is **before the lane starts** — which is what
+the boot sweep takes: it drops bindings whose session no longer exists, and the lane then hydrates
+an already-clean table.
 
 ## Backups and restore
 
