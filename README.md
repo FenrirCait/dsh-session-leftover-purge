@@ -38,6 +38,10 @@ GitHub。每次发版都会同时上传两个附件：带版本号的 `…-X.Y.Z
 的第三方包 `@deepseek-ai/schemastery` 由宿主提供——在 `peerDependencies` 里声明为 optional，
 DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何东西**。
 
+插件用 Node 内置的 `node:sqlite` 读写 bili 的索引：**Node ≥ 22.13 或 ≥ 23.4** 才能免 flag 加载。
+低于这个版本时装得上但 `index.db` 那一半会静默跳过——日志会有一行
+`node:sqlite-unavailable node=…`，看到它就知道该升级运行时时了（`engines.node` 同此口径）。
+
 **功能上配合**（缺了不会报错，只是对应能力自动跳过）：
 
 | 组件 | 缺失时的表现 |
@@ -61,6 +65,7 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 | cost-meter 原始明细文件 | 关 | 删掉 cost-meter 每轮用量的凭证文件 |
 | 开机回收 index.db 空间 | 关 | 回收已删行占用的空间；失败不影响数据 |
 | 备份保留天数 | 7 天 | 过期即删；`0` = 永久保留 |
+| 备份体积上限 | 2048 MB | 超出后从最旧的批次开始删；`0` = 不限。索引快照动辄几百 MB，这一项才是真正兜住磁盘的 |
 | 演练模式 | 关 | 只写日志，不移动也不删除 |
 | 开机对账 | 开 | 启动时扫描孤儿快照并写报告 |
 | 开机清理残留绑定 | 开 | 启动时删掉 `index.db` 里指向已删会话（含其子代理）的三个 `kv_store` blob 条目；写前先备份，演练模式下只报数（须赶在 bili 的 lane 启动之前） |
@@ -97,7 +102,9 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 
 每次清理都在 `~/.dsh/storages/session-leftover-purge/trash/<时间戳>/` 留一份可还原的副本：
 
-- `index.db` / `index.db-wal` / `index.db-shm` —— 删行前的完整数据库
+- `index.db` —— 删行前的完整数据库。优先用 `VACUUM INTO` 写成**单个**一致性快照（读穿 WAL、顺带
+  丢掉空闲页，比整文件复制小；也不存在"WAL 配错主文件"的风险）。旧版 SQLite 或数据库忙时退回
+  三文件字节拷贝（`index.db` / `-wal` / `-shm`）
 - `session-…__*.json` —— 移走的 bili 快照
 - `kv-store.json.bak` —— 开机清扫改写前的 `kv_store` 原始行（后缀不是 `.json`，否则「恢复最近备份」会把它当成快照写回 bili 目录）
 - `ledger.json` —— 改账本前的完整副本（如果动过账本）
@@ -106,11 +113,14 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 恢复入口就是上面那个「恢复最近备份」触发器。恢复时如果 bili 正持有数据库锁，会把文件写成
 `index.db.restored-<时间戳>*` 让你手动换，不会强行覆盖。
 
+该会话在索引里**一行都没有**时（大多是一次性会话，或已经被清过），数据库快照与事务都直接跳过，
+日志记 `no-rows` —— 不为了删 0 行去复制几百 MB。此时 `kv_store` 的残留交给开机清扫处理。
+
 ## 日志
 
 `~/.dsh/storages/session-leftover-purge/`：
 
-- `purge.log` —— 每次启动一行 `ready v…`，每次清理 / 恢复 / 删备份各一行
+- `purge.log` —— 每次启动一行 `ready v…` 与一行 `roots …`，每次清理 / 恢复 / 删备份各一行
 - `orphans.json` —— 最近一次对账结果
 - `triggers.json` —— 已执行过的触发器数字
 
@@ -120,8 +130,11 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 - 子代理只在父会话被清理或对账时连带处理：DSH 不会为 `|sub:` 子会话单独发事件。
 - 开机清扫要抢在 bili 的 lane 启动之前。lane 已在写时本轮放弃（日志 `changed-during-read`），
   下次开机再试；写前必留 `kv-store.json.bak`。
-- 插件状态目录跟 `$DSH_HOME` 走（未设时是 `~/.dsh`），但 bili 的数据目录是用户级的
-  （`~/.local/share/billion-context/sessions` 或 `BILI_SESSIONS_DIR`），不随 profile 隔离。
+- 插件状态目录默认跟 `$DSH_HOME` 走（未设时 `~/.dsh`），可用 `SESSION_LEFTOVER_PURGE_DIR` 覆盖；
+  bili 的数据目录是用户级的（`~/.local/share/billion-context/sessions` 或 `BILI_SESSIONS_DIR`），
+  不随 profile 隔离。想要一套可丢弃的验证环境，把这两个变量都指向临时目录。
+- 每次启动会在 `purge.log` 写一行 `roots state=… bili=… sessions=…`：这个实例到底要动哪份数据，
+  删之前就能看见。
 - bili 的 `index.db` 属于另一个进程，遇到 `SQLITE_BUSY` 会跳过，下次再处理。
 - 不碰 DSH 的附件、不碰 Electron 的 localStorage。
 - 任何失败都只写日志，不抛给 DSH 的删除流程。

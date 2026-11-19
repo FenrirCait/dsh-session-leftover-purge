@@ -43,6 +43,11 @@ service, and the only third-party package it imports — `@deepseek-ai/schemaste
 the host: it is declared as an optional peer dependency and already installed by DSH's own
 `dsh-settings`, so **nothing extra needs installing**.
 
+The plugin reads and writes bili's index through Node's built-in `node:sqlite`: **Node >= 22.13 or
+>= 23.4** loads it without a flag. Below that the package still installs, but the whole `index.db`
+half degrades to "skipped" — look for a `node:sqlite-unavailable node=…` line in the log
+(`engines.node` states the same floor).
+
 **Co-operates with** (missing ones are skipped, never an error):
 
 | Component | Behaviour when absent |
@@ -68,6 +73,7 @@ Nothing to configure. By default it does two things: removes the bili JSON snaps
 | cost-meter raw detail files | off | Deletes the per-turn usage receipts |
 | Reclaim index.db space | off | VACUUMs deleted pages away on boot; a failure leaves data intact |
 | Backup retention | 7 days | Older batches are removed on the next start; `0` keeps them forever |
+| Backup size cap | 2048 MB | Above it the oldest batches go first; `0` = no cap. The index snapshot is hundreds of MB, so this is what actually bounds the disk |
 | Dry run | off | Logs what would happen, moves and deletes nothing |
 | Reconcile on boot | on | Scans for orphan snapshots at startup and writes a report |
 | Sweep stale bindings on boot | on | Drops `kv_store` entries of deleted sessions **and their subagent children** from all three blobs, before bili's lane starts; the rows are backed up first and a dry run only counts |
@@ -111,7 +117,10 @@ an already-clean table.
 Every purge leaves a restorable copy under
 `~/.dsh/storages/session-leftover-purge/trash/<timestamp>/`:
 
-- `index.db` / `index.db-wal` / `index.db-shm` — the full database before any row was deleted
+- `index.db` — the full database before any row was deleted. Written with `VACUUM INTO` when possible:
+  one consistent snapshot read through the WAL, free pages dropped, and no "stale sidecar against a
+  different main file" hazard. Older SQLite builds fall back to the three-file byte copy
+  (`index.db` / `-wal` / `-shm`).
 - `session-…__*.json` — the bili snapshots that were moved away
 - `kv-store.json.bak` — the raw `kv_store` rows before the boot sweep rewrote them (the extension is
   not `.json` on purpose: *Restore latest backup* would otherwise copy it into bili's session tree)
@@ -126,7 +135,7 @@ in manually — the running database is never overwritten by force.
 
 Under `~/.dsh/storages/session-leftover-purge/`:
 
-- `purge.log` — one `ready v…` line per start, one line per purge / restore / backup deletion
+- `purge.log` — one `ready v…` and one `roots …` line per start, one line per purge / restore / backup deletion
 - `orphans.json` — result of the last reconcile pass
 - `triggers.json` — the trigger numbers that have already fired
 
@@ -138,9 +147,12 @@ Under `~/.dsh/storages/session-leftover-purge/`:
 - The boot sweep has to win the race against bili's lane. If the lane is already writing, this
   round gives up (`changed-during-read` in the log) and retries on the next start; the rows it
   would have changed are backed up to `kv-store.json.bak` first.
-- The plugin's own state follows `$DSH_HOME` (default `~/.dsh`), but bili's data directory is
-  user-level (`~/.local/share/billion-context/sessions` or `BILI_SESSIONS_DIR`) and is not
-  isolated per profile.
+- The plugin's own state follows `$DSH_HOME` (default `~/.dsh`) and can be overridden with
+  `SESSION_LEFTOVER_PURGE_DIR`; bili's data directory is user-level
+  (`~/.local/share/billion-context/sessions` or `BILI_SESSIONS_DIR`) and is not isolated per profile.
+  For a genuinely disposable test setup, point both at a temp directory.
+- Every start writes one `roots state=… bili=… sessions=…` line to the log, so you can see which
+  data an instance is about to touch before it deletes anything.
 - bili's `index.db` belongs to another process, so a `SQLITE_BUSY` is skipped and retried next time.
 - Never touches DSH attachments or Electron's localStorage.
 - Every failure is logged only; nothing is thrown into DSH's own delete flow.
