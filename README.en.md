@@ -70,7 +70,7 @@ Nothing to configure. By default it does two things: removes the bili JSON snaps
 | Backup retention | 7 days | Older batches are removed on the next start; `0` keeps them forever |
 | Dry run | off | Logs what would happen, moves and deletes nothing |
 | Reconcile on boot | on | Scans for orphan snapshots at startup and writes a report |
-| Sweep stale bindings on boot | on | Drops `kv_store` bindings that point at sessions the index no longer has, before bili's lane starts |
+| Sweep stale bindings on boot | on | Drops `kv_store` entries of deleted sessions **and their subagent children** from all three blobs, before bili's lane starts; the rows are backed up first and a dry run only counts |
 | Auto purge orphans | off | Cleans orphans found during reconcile instead of only reporting |
 | Boot delay | 8000 ms | How long to wait before reconciling |
 
@@ -91,9 +91,14 @@ fields, not buttons, so bumping a number is how an action is expressed.
   `state_hash` that belonged to the session has to lose one reference. Skip this and the blob
   stays pinned at `refcount > 0` forever, invisible to the orphan sweep — that is exactly how a
   real database accumulated hundreds of rows nobody could collect
-- **JSON blobs**: `plugin-conversations/table` and `prefix-affinity/v1` in `kv_store` are keyed
-  by session id, so a `WHERE session_id = ?` delete never reaches them and a binding survives
-  that the panel does not show
+- **JSON blobs**: three blobs in `kv_store` are keyed by session id — `plugin-conversations/table`,
+  `prefix-affinity/v1` and `session-order/v1` (replayed into bili's skeleton cache on start), so a
+  `WHERE session_id = ?` delete never reaches them and a binding survives that the panel does not
+  show
+- **Subagent pseudo-sessions**: bili files a subagent run as its own session,
+  `session-<parent>|sub:<hex>`. Its `deleteSession` only ever deletes the exact id, and DSH only
+  emits one delete event for the parent, so those rows used to stay forever. Deleting a parent now
+  takes its whole `|sub:` family with it: rows, content references, the three blobs, snapshots
 
 The last one has a timing trap: bili's lane keeps the whole conversation table in memory and
 **rewrites `kv_store` from memory on every request**, so a binding removed during the purge is
@@ -108,6 +113,8 @@ Every purge leaves a restorable copy under
 
 - `index.db` / `index.db-wal` / `index.db-shm` — the full database before any row was deleted
 - `session-…__*.json` — the bili snapshots that were moved away
+- `kv-store.json.bak` — the raw `kv_store` rows before the boot sweep rewrote them (the extension is
+  not `.json` on purpose: *Restore latest backup* would otherwise copy it into bili's session tree)
 - `ledger.json` — the full ledger before it was edited (only when the ledger was touched)
 - `cost-files/` — the cost-meter detail files that were removed
 
@@ -126,6 +133,14 @@ Under `~/.dsh/storages/session-leftover-purge/`:
 ## Limits
 
 - Only covers deletes made through archive-manager; other paths are caught by the boot reconcile.
+- Subagent pseudo-sessions are only cleaned together with their parent: DSH never emits an event
+  for a `|sub:` child.
+- The boot sweep has to win the race against bili's lane. If the lane is already writing, this
+  round gives up (`changed-during-read` in the log) and retries on the next start; the rows it
+  would have changed are backed up to `kv-store.json.bak` first.
+- The plugin's own state follows `$DSH_HOME` (default `~/.dsh`), but bili's data directory is
+  user-level (`~/.local/share/billion-context/sessions` or `BILI_SESSIONS_DIR`) and is not
+  isolated per profile.
 - bili's `index.db` belongs to another process, so a `SQLITE_BUSY` is skipped and retried next time.
 - Never touches DSH attachments or Electron's localStorage.
 - Every failure is logged only; nothing is thrown into DSH's own delete flow.

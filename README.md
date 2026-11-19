@@ -63,7 +63,7 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 | 备份保留天数 | 7 天 | 过期即删；`0` = 永久保留 |
 | 演练模式 | 关 | 只写日志，不移动也不删除 |
 | 开机对账 | 开 | 启动时扫描孤儿快照并写报告 |
-| 开机清理残留绑定 | 开 | 启动时删掉 `index.db` 里指向已删会话的 `kv_store` 绑定（须赶在 bili 的 lane 启动之前） |
+| 开机清理残留绑定 | 开 | 启动时删掉 `index.db` 里指向已删会话（含其子代理）的三个 `kv_store` blob 条目；写前先备份，演练模式下只报数（须赶在 bili 的 lane 启动之前） |
 | 自动清理孤儿 | 关 | 对账发现孤儿就直接清理 |
 | 开机延迟 | 8000 ms | 开机对账前等待多久 |
 
@@ -81,8 +81,12 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 - **`content` 的引用计数**：每个被删掉的 `content_hash` / `media_hash` / `summary_hash` /
   `one_hash` / `state_hash` 都要把 `refcount` 减一。不减的话 blob 永远停在 `refcount > 0`，
   孤儿清扫永远看不到它——真实环境里就是这么攒出几百行「没人引用但删不掉」的泄漏
-- **JSON blob**：`kv_store` 里的 `plugin-conversations/table` 与 `prefix-affinity/v1` 用会话 id
-  做键，按 `session_id` 列删表的做法碰不到它们，会留下一条面板看不见的绑定
+- **JSON blob**：`kv_store` 里有三个 blob 用会话 id 做键——`plugin-conversations/table`、
+  `prefix-affinity/v1`、`session-order/v1`（bili 启动时会把它回放进 skeleton 缓存）。按
+  `session_id` 列删表的做法碰不到它们，会留下一条面板看不见的绑定
+- **子代理伪会话**：bili 把子代理存成独立会话 `session-<父>|sub:<hex>`。它自己的
+  `deleteSession` 只按精确 id 删，DSH 的删除事件也只发父会话，所以这一整类以前会永久留下。
+  现在删一个父会话会连带它的全部 `|sub:` 子会话：行、内容引用、三个 blob 条目、快照文件
 
 最后一项有个时序坑：bili 的 lane 进程把整张会话表放在内存里，**每处理一个请求就整表覆盖一次
 `kv_store`**。所以删除当时清掉的绑定，几秒后会被写回内存里的旧值。真正有效的窗口是
@@ -95,6 +99,7 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 
 - `index.db` / `index.db-wal` / `index.db-shm` —— 删行前的完整数据库
 - `session-…__*.json` —— 移走的 bili 快照
+- `kv-store.json.bak` —— 开机清扫改写前的 `kv_store` 原始行（后缀不是 `.json`，否则「恢复最近备份」会把它当成快照写回 bili 目录）
 - `ledger.json` —— 改账本前的完整副本（如果动过账本）
 - `cost-files/` —— 删掉的 cost-meter 明细文件
 
@@ -112,6 +117,11 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 ## 边界
 
 - 只处理通过 archive-manager 删除会话的场景；其它途径靠开机对账发现。
+- 子代理只在父会话被清理或对账时连带处理：DSH 不会为 `|sub:` 子会话单独发事件。
+- 开机清扫要抢在 bili 的 lane 启动之前。lane 已在写时本轮放弃（日志 `changed-during-read`），
+  下次开机再试；写前必留 `kv-store.json.bak`。
+- 插件状态目录跟 `$DSH_HOME` 走（未设时是 `~/.dsh`），但 bili 的数据目录是用户级的
+  （`~/.local/share/billion-context/sessions` 或 `BILI_SESSIONS_DIR`），不随 profile 隔离。
 - bili 的 `index.db` 属于另一个进程，遇到 `SQLITE_BUSY` 会跳过，下次再处理。
 - 不碰 DSH 的附件、不碰 Electron 的 localStorage。
 - 任何失败都只写日志，不抛给 DSH 的删除流程。
