@@ -120,7 +120,7 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 
 `~/.dsh/storages/session-leftover-purge/`：
 
-- `purge.log` —— 每次启动一行 `ready v…`，每次清理 / 恢复 / 删备份各一行
+- `purge.log` —— 每次启动一行 `ready v…` 与一行 `roots …`，每次清理 / 恢复 / 删备份各一行
 - `orphans.json` —— 最近一次对账结果
 - `triggers.json` —— 已执行过的触发器数字
 
@@ -130,8 +130,11 @@ DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何�
 - 子代理只在父会话被清理或对账时连带处理：DSH 不会为 `|sub:` 子会话单独发事件。
 - 开机清扫要抢在 bili 的 lane 启动之前。lane 已在写时本轮放弃（日志 `changed-during-read`），
   下次开机再试；写前必留 `kv-store.json.bak`。
-- 插件状态目录跟 `$DSH_HOME` 走（未设时是 `~/.dsh`），但 bili 的数据目录是用户级的
-  （`~/.local/share/billion-context/sessions` 或 `BILI_SESSIONS_DIR`），不随 profile 隔离。
+- 插件状态目录默认跟 `$DSH_HOME` 走（未设时 `~/.dsh`），可用 `SESSION_LEFTOVER_PURGE_DIR` 覆盖；
+  bili 的数据目录是用户级的（`~/.local/share/billion-context/sessions` 或 `BILI_SESSIONS_DIR`），
+  不随 profile 隔离。想要一套可丢弃的验证环境，把这两个变量都指向临时目录。
+- 每次启动会在 `purge.log` 写一行 `roots state=… bili=… sessions=…`：这个实例到底要动哪份数据，
+  删之前就能看见。
 - bili 的 `index.db` 属于另一个进程，遇到 `SQLITE_BUSY` 会跳过，下次再处理。
 - 不碰 DSH 的附件、不碰 Electron 的 localStorage。
 - 任何失败都只写日志，不抛给 DSH 的删除流程。

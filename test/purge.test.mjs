@@ -348,3 +348,19 @@ test('an id that is not a session id is refused', async () => {
   assert.equal(db.count('sessions'), 3);
   db.close();
 });
+
+test('the state directory can be pointed somewhere disposable', async () => {
+  const { home } = makeScenario();
+  const custom = path.join(home, 'state-override');
+  process.env.SESSION_LEFTOVER_PURGE_DIR = custom;
+  try {
+    const paths = await import('../lib/paths.js');
+    assert.equal(paths.stateDir(), custom);
+    await purgeSession(PARENT, CFG, QUIET);
+    assert.equal(fs.existsSync(path.join(custom, 'trash')), true);
+    // Nothing landed in the profile-derived location for this run.
+    assert.equal(fs.existsSync(path.join(home, 'storages', 'session-leftover-purge', 'trash')), false);
+  } finally {
+    delete process.env.SESSION_LEFTOVER_PURGE_DIR;
+  }
+});

@@ -135,7 +135,7 @@ in manually — the running database is never overwritten by force.
 
 Under `~/.dsh/storages/session-leftover-purge/`:
 
-- `purge.log` — one `ready v…` line per start, one line per purge / restore / backup deletion
+- `purge.log` — one `ready v…` and one `roots …` line per start, one line per purge / restore / backup deletion
 - `orphans.json` — result of the last reconcile pass
 - `triggers.json` — the trigger numbers that have already fired
 
@@ -147,9 +147,12 @@ Under `~/.dsh/storages/session-leftover-purge/`:
 - The boot sweep has to win the race against bili's lane. If the lane is already writing, this
   round gives up (`changed-during-read` in the log) and retries on the next start; the rows it
   would have changed are backed up to `kv-store.json.bak` first.
-- The plugin's own state follows `$DSH_HOME` (default `~/.dsh`), but bili's data directory is
-  user-level (`~/.local/share/billion-context/sessions` or `BILI_SESSIONS_DIR`) and is not
-  isolated per profile.
+- The plugin's own state follows `$DSH_HOME` (default `~/.dsh`) and can be overridden with
+  `SESSION_LEFTOVER_PURGE_DIR`; bili's data directory is user-level
+  (`~/.local/share/billion-context/sessions` or `BILI_SESSIONS_DIR`) and is not isolated per profile.
+  For a genuinely disposable test setup, point both at a temp directory.
+- Every start writes one `roots state=… bili=… sessions=…` line to the log, so you can see which
+  data an instance is about to touch before it deletes anything.
 - bili's `index.db` belongs to another process, so a `SQLITE_BUSY` is skipped and retried next time.
 - Never touches DSH attachments or Electron's localStorage.
 - Every failure is logged only; nothing is thrown into DSH's own delete flow.
