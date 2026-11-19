@@ -14,6 +14,9 @@ import {
   purgeSession,
   sweepGhostKv,
 } from '../lib/purge.js';
+import { sweepTrash } from '../lib/backup.js';
+
+const UNKNOWN = 'session-00000000-0000-0000-0000-000000000000';
 
 const PARENT = 'session-11111111-2222-3333-4444-555555555555';
 const CHILD = `${PARENT}|sub:abcdef012345`;
@@ -155,6 +158,9 @@ test('purgeSession removes the whole family and releases content refcounts', asy
   const { biliRoot, home, protocolDir } = makeScenario();
   const report = await purgeSession(PARENT, CFG, QUIET);
   assert.equal(report.biliIndexDb.ok, true);
+  // One compact snapshot, not the three-file byte copy.
+  assert.equal(report.biliIndexDb.backup.mode, 'vacuum-into');
+  assert.deepEqual(report.biliIndexDb.backup.files, ['index.db']);
 
   const db = readDb(biliRoot);
   assert.equal(db.count('messages', 'session_id = ? OR session_id LIKE ?', PARENT, `${PARENT}|sub:%`), 0);
@@ -292,6 +298,46 @@ test('purgeBiliIndexDb refuses to act when the database has no rows', async () =
   raw.close();
   const result = await sweepGhostKv({ dryRun: false }, QUIET);
   assert.equal(result.reason, 'no-sessions');
+});
+
+test('a session with no index rows skips the snapshot entirely', async () => {
+  const { biliRoot, home } = makeScenario();
+  const batch = path.join(home, 'batch-none');
+  const result = await purgeBiliIndexDb(UNKNOWN, { dryRun: false, biliIndexDb: true }, QUIET, batch);
+  assert.equal(result.reason, 'no-rows');
+  // No 300 MB copy to delete zero rows, and nothing was touched.
+  assert.equal(fs.existsSync(batch), false);
+  const db = readDb(biliRoot);
+  assert.equal(db.count('sessions'), 3);
+  db.close();
+});
+
+test('the trash cap deletes the oldest batches first', async () => {
+  const { home } = makeScenario();
+  const trash = path.join(home, 'storages', 'session-leftover-purge', 'trash');
+  const write = (name, bytes) => {
+    fs.mkdirSync(path.join(trash, name), { recursive: true });
+    fs.writeFileSync(path.join(trash, name, 'index.db'), Buffer.alloc(bytes));
+  };
+  write('2020-01-01T00-00-00-000Z', 600 * 1024);
+  write('2020-01-02T00-00-00-000Z', 600 * 1024);
+  write('2020-01-03T00-00-00-000Z', 600 * 1024);
+
+  const swept = await sweepTrash({ trashRetentionDays: 0, trashMaxMb: 1 }, QUIET);
+  assert.equal(swept.trimmed, 2);
+  assert.equal(swept.bytesAfter <= 1024 * 1024, true);
+  assert.deepEqual(fs.readdirSync(trash), ['2020-01-03T00-00-00-000Z']);
+});
+
+test('age retention is skipped when set to 0 but the cap still applies', async () => {
+  const { home } = makeScenario();
+  const trash = path.join(home, 'storages', 'session-leftover-purge', 'trash');
+  fs.mkdirSync(path.join(trash, 'old'), { recursive: true });
+  fs.writeFileSync(path.join(trash, 'old', 'index.db'), Buffer.alloc(2048));
+  const swept = await sweepTrash({ trashRetentionDays: 0, trashMaxMb: 0 }, QUIET);
+  assert.equal(swept.removed, 0);
+  assert.equal(swept.ageSkipped, true);
+  assert.equal(swept.sizeSkipped, true);
 });
 
 test('an id that is not a session id is refused', async () => {

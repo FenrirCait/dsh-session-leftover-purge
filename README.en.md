@@ -73,6 +73,7 @@ Nothing to configure. By default it does two things: removes the bili JSON snaps
 | cost-meter raw detail files | off | Deletes the per-turn usage receipts |
 | Reclaim index.db space | off | VACUUMs deleted pages away on boot; a failure leaves data intact |
 | Backup retention | 7 days | Older batches are removed on the next start; `0` keeps them forever |
+| Backup size cap | 2048 MB | Above it the oldest batches go first; `0` = no cap. The index snapshot is hundreds of MB, so this is what actually bounds the disk |
 | Dry run | off | Logs what would happen, moves and deletes nothing |
 | Reconcile on boot | on | Scans for orphan snapshots at startup and writes a report |
 | Sweep stale bindings on boot | on | Drops `kv_store` entries of deleted sessions **and their subagent children** from all three blobs, before bili's lane starts; the rows are backed up first and a dry run only counts |
@@ -116,7 +117,10 @@ an already-clean table.
 Every purge leaves a restorable copy under
 `~/.dsh/storages/session-leftover-purge/trash/<timestamp>/`:
 
-- `index.db` / `index.db-wal` / `index.db-shm` — the full database before any row was deleted
+- `index.db` — the full database before any row was deleted. Written with `VACUUM INTO` when possible:
+  one consistent snapshot read through the WAL, free pages dropped, and no "stale sidecar against a
+  different main file" hazard. Older SQLite builds fall back to the three-file byte copy
+  (`index.db` / `-wal` / `-shm`).
 - `session-…__*.json` — the bili snapshots that were moved away
 - `kv-store.json.bak` — the raw `kv_store` rows before the boot sweep rewrote them (the extension is
   not `.json` on purpose: *Restore latest backup* would otherwise copy it into bili's session tree)
