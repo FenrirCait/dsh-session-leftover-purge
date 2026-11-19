@@ -43,6 +43,11 @@ service, and the only third-party package it imports — `@deepseek-ai/schemaste
 the host: it is declared as an optional peer dependency and already installed by DSH's own
 `dsh-settings`, so **nothing extra needs installing**.
 
+The plugin reads and writes bili's index through Node's built-in `node:sqlite`: **Node >= 22.13 or
+>= 23.4** loads it without a flag. Below that the package still installs, but the whole `index.db`
+half degrades to "skipped" — look for a `node:sqlite-unavailable node=…` line in the log
+(`engines.node` states the same floor).
+
 **Co-operates with** (missing ones are skipped, never an error):
 
 | Component | Behaviour when absent |

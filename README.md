@@ -38,6 +38,10 @@ GitHub。每次发版都会同时上传两个附件：带版本号的 `…-X.Y.Z
 的第三方包 `@deepseek-ai/schemastery` 由宿主提供——在 `peerDependencies` 里声明为 optional，
 DSH 自带的 `dsh-settings` 本来就会装它，**不需要额外安装任何东西**。
 
+插件用 Node 内置的 `node:sqlite` 读写 bili 的索引：**Node ≥ 22.13 或 ≥ 23.4** 才能免 flag 加载。
+低于这个版本时装得上但 `index.db` 那一半会静默跳过——日志会有一行
+`node:sqlite-unavailable node=…`，看到它就知道该升级运行时时了（`engines.node` 同此口径）。
+
 **功能上配合**（缺了不会报错，只是对应能力自动跳过）：
 
 | 组件 | 缺失时的表现 |
