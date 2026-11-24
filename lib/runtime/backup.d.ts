@@ -29,6 +29,20 @@ export declare function deleteAllBatches(logger?: Logger): Promise<{
     failed: string[];
 }>;
 /**
+ * Re-apply a kv restore at boot, before bili's lane can start.
+ * Returns `none` when there is nothing pending.
+ */
+export declare function applyPendingKvRestore(): Promise<string>;
+/**
+ * Put renamed-aside files back. The target may be a *partial* copy left by a
+ * failed `copyFile`, so it is removed first: an existing file does not mean the
+ * copy succeeded (Codex, PR #10).
+ */
+export declare function restoreAsides(moved: Array<{
+    live: string;
+    aside: string;
+}>): Promise<void>;
+/**
  * Put the newest batch back.
  *
  * The rule everywhere is the same: never overwrite a file some other process is
