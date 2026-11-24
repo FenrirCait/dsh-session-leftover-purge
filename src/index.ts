@@ -5,6 +5,8 @@ import { Config } from './schema.js';
 import { DEFAULTS, configPath, loadConfig, readLiveConfig } from './config.js';
 import { BiliAdapter, sweepGhostKv } from './adapters/bili.js';
 import { CostMeterAdapter } from './adapters/cost-meter.js';
+import { DshContextAdapter } from './adapters/dsh-context.js';
+import { ArchiveProjcacheAdapter } from './adapters/archive-projcache.js';
 import { vacuumIndex } from './adapters/bili-index.js';
 import { listSnapshotFiles, readSnapshotId } from './adapters/bili-snapshots.js';
 import { familyOf, isSessionId, subagentParentOf } from './core/family.js';
@@ -87,7 +89,15 @@ export function apply(ctx: HostContext, config?: unknown): () => void {
   let disposed = false;
   let storePromise: Promise<SessionStore> | undefined;
   const store = (): Promise<SessionStore> => (storePromise ??= loadSessionStore());
-  const adapters = (): Adapter[] => [new BiliAdapter(), new CostMeterAdapter()];
+  // Order is deliberate: bili owns the only irreversible work (rows and blobs),
+  // so it goes first while the batch dir is still empty; the caches at the end
+  // are cheap, idempotent and report-only by default.
+  const adapters = (): Adapter[] => [
+    new BiliAdapter(),
+    new CostMeterAdapter(),
+    new DshContextAdapter(),
+    new ArchiveProjcacheAdapter(),
+  ];
 
   // `node:sqlite` carries the whole index half of this plugin. On an older Node
   // the import fails and every caller degrades to "skipped", which looks exactly
