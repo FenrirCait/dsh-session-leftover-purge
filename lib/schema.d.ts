@@ -4,6 +4,11 @@ import z from '@deepseek-ai/schemastery';
  * puts it in the plugin form and lets an edit take effect without a restart
  * (the Loader hands `apply` live references and commits edits in place).
  *
+ * Descriptions are bilingual on purpose: schemastery descriptions are static
+ * strings chosen at module load, so there is no per-locale variant to select —
+ * the card itself (`lib/client.js`) is localised through `ctx.locale`, and these
+ * strings are the fallback for hosts that render the raw schema.
+ *
  * The last three fields are actions, not values: DSH renders schema fields, not
  * buttons, so an action is expressed as "bump this number". The plugin remembers
  * the last number it acted on, which makes each bump fire exactly once.

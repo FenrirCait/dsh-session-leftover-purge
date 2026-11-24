@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Session leftovers",
+    "description": "Purges bili / cost-meter / dsh-context / archive-manager leftovers after a session is deleted, including subagent families and a boot reconcile.",
+    "detail": "README.en.md"
+  }
+}
