@@ -7,6 +7,12 @@ import { archiveProjcacheRoot, biliSessionsRoot, costMeterDetailsRoot, dshContex
 const DB = 'index.db';
 const SIDECARS = ['', '-wal', '-shm'];
 const LEDGER = 'ledger.json';
+/**
+ * A kv restore that lands while bili's lane is running can be overwritten by the
+ * lane's next request (it rewrites these blobs from memory). The rows are also
+ * written here, and the boot pass re-applies them before the lane can start.
+ */
+const PENDING_KV = 'kv-store.restored-pending.bak';
 
 function trashRoot(): string {
   return path.join(stateDir(), 'trash');
@@ -215,14 +221,25 @@ async function restoreKv(file: string): Promise<string> {
     db = new sqlite.DatabaseSync(dbFile);
     const exec = (sql: string): void => (db as unknown as { exec(sql: string): void }).exec(sql);
     exec('PRAGMA busy_timeout = 4000');
+    // Older bili schemas have no updated_at; the purge path already tolerates
+    // that variant, so the restore must too (Codex, PR #10).
+    const columns = (db.prepare('PRAGMA table_info("kv_store")').all() as Array<{ name?: unknown }>)
+      .map((row) => row.name)
+      .filter((name): name is string => typeof name === 'string');
+    if (!columns.includes('namespace') || !columns.includes('key') || !columns.includes('value_json')) {
+      return 'skipped:kv_store-missing';
+    }
+    const hasUpdatedAt = columns.includes('updated_at');
     exec('BEGIN IMMEDIATE');
-    const stmt = db.prepare('UPDATE kv_store SET value_json = ?, updated_at = ? WHERE namespace = ? AND key = ?');
+    const stmt = hasUpdatedAt
+      ? db.prepare('UPDATE kv_store SET value_json = ?, updated_at = ? WHERE namespace = ? AND key = ?')
+      : db.prepare('UPDATE kv_store SET value_json = ? WHERE namespace = ? AND key = ?');
     for (const row of rows) {
       if (typeof row.namespace !== 'string' || typeof row.key !== 'string') continue;
-      stmt.run(String(row.value_json ?? ''), Date.now(), row.namespace, row.key);
+      if (hasUpdatedAt) stmt.run(String(row.value_json ?? ''), Date.now(), row.namespace, row.key);
+      else stmt.run(String(row.value_json ?? ''), row.namespace, row.key);
     }
     exec('COMMIT');
-    return 'applied';
   } catch (error) {
     try {
       (db as unknown as { exec(sql: string): void }).exec('ROLLBACK');
@@ -235,6 +252,55 @@ async function restoreKv(file: string): Promise<string> {
       db?.close();
     } catch {
       /* already closed */
+    }
+  }
+  // Keep a copy for the boot pass: bili's lane rewrites these blobs from memory,
+  // so a restore that lands while it runs can be undone by its next request.
+  // The next start applies it again before the lane exists (Codex, PR #10).
+  try {
+    await fs.promises.writeFile(path.join(biliSessionsRoot(), PENDING_KV), JSON.stringify(rows));
+  } catch {
+    /* the restore itself succeeded; a missing marker only costs the retry */
+  }
+  return 'applied';
+}
+
+/**
+ * Re-apply a kv restore at boot, before bili's lane can start.
+ * Returns `none` when there is nothing pending.
+ */
+export async function applyPendingKvRestore(): Promise<string> {
+  const marker = path.join(biliSessionsRoot(), PENDING_KV);
+  if (!fs.existsSync(marker)) return 'none';
+  const result = await restoreKv(marker);
+  if (result === 'applied') {
+    try {
+      await fs.promises.rm(marker, { force: true });
+    } catch {
+      /* nothing to clean up */
+    }
+    await logLine('apply-pending-kv applied');
+  }
+  return result;
+}
+
+/**
+ * Put renamed-aside files back. The target may be a *partial* copy left by a
+ * failed `copyFile`, so it is removed first: an existing file does not mean the
+ * copy succeeded (Codex, PR #10).
+ */
+export async function restoreAsides(moved: Array<{ live: string; aside: string }>): Promise<void> {
+  for (const { live, aside } of moved) {
+    if (!fs.existsSync(aside)) continue;
+    try {
+      await fs.promises.rm(live, { force: true });
+    } catch {
+      /* best effort: a partial file must not block the rename */
+    }
+    try {
+      await fs.promises.rename(aside, live);
+    } catch {
+      /* leave the aside for manual recovery */
     }
   }
 }
@@ -321,10 +387,14 @@ export async function restoreLatest(logger?: Logger): Promise<{
     const target = path.join(biliSessionsRoot(), DB);
     const tag = stamp();
     if (await canTakeWriteLock(target)) {
+      const moved: Array<{ live: string; aside: string }> = [];
       try {
         for (const suffix of SIDECARS) {
           const live = `${target}${suffix}`;
-          if (fs.existsSync(live)) await fs.promises.rename(live, `${live}.before-restore-${tag}`);
+          if (!fs.existsSync(live)) continue;
+          const aside = `${live}.before-restore-${tag}`;
+          await fs.promises.rename(live, aside);
+          moved.push({ live, aside });
         }
         for (const suffix of SIDECARS) {
           const source = path.join(dbDir, `${DB}${suffix}`);
@@ -333,18 +403,8 @@ export async function restoreLatest(logger?: Logger): Promise<{
         database = 'applied';
       } catch (error) {
         // A failed restore must not leave the index missing: put every aside
-        // file back where it was (Codex, PR #8).
-        for (const suffix of SIDECARS) {
-          const live = `${target}${suffix}`;
-          const aside = `${live}.before-restore-${tag}`;
-          if (fs.existsSync(aside) && !fs.existsSync(live)) {
-            try {
-              await fs.promises.rename(aside, live);
-            } catch {
-              /* leave the aside for manual recovery */
-            }
-          }
-        }
+        // file back, removing any partial copy first (Codex, PR #8 and #10).
+        await restoreAsides(moved);
         database = `failed:${String(error)}`;
       }
     } else {
@@ -372,15 +432,9 @@ export async function restoreLatest(logger?: Logger): Promise<{
         await fs.promises.copyFile(ledgerCopy, target);
         ledger = 'applied';
       } catch (error) {
-        // Same rule as the database: a failed copy puts the original back.
-        const aside = `${target}.before-restore-${tag}`;
-        if (fs.existsSync(aside) && !fs.existsSync(target)) {
-          try {
-            await fs.promises.rename(aside, target);
-          } catch {
-            /* leave the aside for manual recovery */
-          }
-        }
+        // Same rule as the database: a failed copy puts the original back,
+        // even when a partial target file exists.
+        await restoreAsides([{ live: target, aside: `${target}.before-restore-${tag}` }]);
         ledger = `failed:${String(error)}`;
       }
     }
@@ -413,7 +467,12 @@ export async function restoreLatest(logger?: Logger): Promise<{
   let caches = 0;
   try {
     caches += await restoreTree(path.join(batch.dir, 'cache'), path.join(dshContextRoot(), 'overview-cache.v3'));
-    caches += await restoreTree(path.join(batch.dir, 'projcache'), archiveProjcacheRoot());
+    // The adapter backs projcache files up by basename, but live ones sit under
+    // `<root>/sessions/` when that directory exists and listSessionFiles prefers
+    // it — restoring into the root would leave them invisible (Codex, PR #10).
+    const projRoot = archiveProjcacheRoot();
+    const projNested = path.join(projRoot, 'sessions');
+    caches += await restoreTree(path.join(batch.dir, 'projcache'), fs.existsSync(projNested) ? projNested : projRoot);
   } catch (error) {
     logger?.warn(`session-leftover-purge: cannot restore cache backups: ${String(error)}`);
   }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-leftover-purge",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "删除会话后清理 bili / cost-meter / dsh-context / archive-manager 的残留 / Purge session leftovers across DSH plugins",
   "type": "module",
   "scripts": {
