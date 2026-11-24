@@ -44,8 +44,14 @@ export function countFamilyRows(db: Sql, family: Family): number {
   for (const table of DELETE_TABLES) {
     const columns = tableColumns(db, table);
     if (!columns.includes('session_id')) continue;
+    // Pinned checkpoints are bili's GC anchor and survive by design; counting
+    // them would make every verify() report a leftover that is meant to be there.
+    const where =
+      table === 'checkpoints' && columns.includes('pinned')
+        ? `${familyClause('session_id')} AND pinned = 0`
+        : familyClause('session_id');
     try {
-      const row = db.prepare(`SELECT COUNT(*) AS n FROM "${table}" WHERE ${familyClause('session_id')}`).get(...familyArgs(family)) as
+      const row = db.prepare(`SELECT COUNT(*) AS n FROM "${table}" WHERE ${where}`).get(...familyArgs(family)) as
         | { n?: unknown }
         | undefined;
       total += Number(row?.n ?? 0);
