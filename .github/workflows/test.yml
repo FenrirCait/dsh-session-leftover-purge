@@ -12,10 +12,23 @@ jobs:
   test:
     # node:sqlite is stable from Node 24 on; the plugin ships against it, so the
     # CI runs on the same major as the runtime it is written for.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Paths, file locks and CRLF are where this plugin actually breaks;
+        # Windows has to be part of the gate.
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm run build
       - run: node --test
