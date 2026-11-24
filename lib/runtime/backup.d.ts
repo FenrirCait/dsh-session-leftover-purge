@@ -1,4 +1,5 @@
 import type { Logger, PluginConfig } from '../types.js';
+export declare function logLine(line: string): Promise<void>;
 export interface Batch {
     name: string;
     dir: string;

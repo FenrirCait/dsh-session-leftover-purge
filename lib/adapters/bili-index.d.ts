@@ -38,3 +38,21 @@ export interface FamilyVerify {
     kvHits: string[];
 }
 export declare function verifyFamily(db: Sql, family: Family): FamilyVerify;
+/**
+ * Reclaim the space deleted rows leave behind.
+ *
+ * `DELETE` only marks pages free; the old bytes stay in the file and the WAL,
+ * which is why a plain grep still finds a removed session id. VACUUM rewrites
+ * the file and `wal_checkpoint(TRUNCATE)` empties the journalled copy. This
+ * takes an exclusive lock on another process's database, so it runs once per
+ * boot, after an integrity check: vacuuming an already-damaged database can
+ * turn a readable file into a broken one.
+ */
+export declare function vacuumIndex(dbFile: string, logger?: {
+    warn(message: string): void;
+}): Promise<{
+    ok: boolean;
+    reason?: string;
+    bytesBefore?: number;
+    bytesAfter?: number;
+}>;

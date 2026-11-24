@@ -16,7 +16,7 @@ function stamp(): string {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
-async function logLine(line: string): Promise<void> {
+export async function logLine(line: string): Promise<void> {
   try {
     await fs.promises.mkdir(stateDir(), { recursive: true });
     await fs.promises.appendFile(path.join(stateDir(), 'purge.log'), `${new Date().toISOString()} ${line}\n`, 'utf8');
