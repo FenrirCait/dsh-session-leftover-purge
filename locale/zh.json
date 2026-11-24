@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "会话残留清理",
+    "description": "删除会话后清理 bili / cost-meter / dsh-context / archive-manager 的残留，含会话族（子代理）与开机对账。",
+    "detail": "README.md"
+  }
+}
