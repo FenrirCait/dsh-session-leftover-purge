@@ -46,6 +46,8 @@ export interface PlanItem {
 }
 export interface AdapterPlan {
     adapter: AdapterId;
+    /** The family this plan was built for; `apply()` gets it back. */
+    family: Family;
     items: PlanItem[];
     /** Free-form lines shown in the dry-run report. */
     notes: string[];
@@ -53,6 +55,7 @@ export interface AdapterPlan {
     writes: number;
 }
 export interface ApplyOptions {
+    cfg: PluginConfig;
     dryRun: boolean;
     /** Batch directory created by the runtime before apply(). */
     batchDir: string;
