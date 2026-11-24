@@ -8,7 +8,7 @@ import type {
   SessionStore,
   VerifyResult,
 } from '../types.js';
-import { familyRootOf } from '../core/family.js';
+import { familyRootOf, isSessionId } from '../core/family.js';
 import { listSnapshotFiles, readSnapshotId } from '../adapters/bili-snapshots.js';
 import { trashDir } from './paths.js';
 
@@ -48,6 +48,9 @@ export interface PurgeDeps {
  *    keep bili's leftovers alive.
  */
 export async function purgeFamily(family: Family, deps: PurgeDeps): Promise<FamilyRun> {
+  // Defense in depth: adapters trust the id they are handed, and orphan ids come
+  // straight from bili's JSON (which also holds non-DSH sessions).
+  if (!isSessionId(family.id)) return { family, skipped: 'bad-id', adapters: [] };
   if (deps.store.has(family.id)) return { family, skipped: 'session-alive', adapters: [] };
 
   const batchDir = trashDir();

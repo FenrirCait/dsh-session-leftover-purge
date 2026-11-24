@@ -10,7 +10,7 @@ import { ArchiveProjcacheAdapter } from './adapters/archive-projcache.js';
 import { vacuumIndex } from './adapters/bili-index.js';
 import { listSnapshotFiles, readSnapshotId } from './adapters/bili-snapshots.js';
 import { familyOf, isSessionId, subagentParentOf } from './core/family.js';
-import { loadSessionStore } from './core/session-store.js';
+import { createStoreCache } from './runtime/store-cache.js';
 import { findOrphanFamilies, purgeFamily } from './runtime/execute.js';
 import type { FamilyRun } from './runtime/execute.js';
 import { deleteAllBatches, logLine, restoreLatest, sweepTrash } from './runtime/backup.js';
@@ -87,8 +87,9 @@ export function apply(ctx: HostContext, config?: unknown): () => void {
 
   const inFlight = new Set<string>();
   let disposed = false;
-  let storePromise: Promise<SessionStore> | undefined;
-  const store = (): Promise<SessionStore> => (storePromise ??= loadSessionStore());
+  // The boot pass may cache; the delete path must not (see attempt()).
+  const storeCache = createStoreCache();
+  const store = (): Promise<SessionStore> => storeCache.cached();
   // Order is deliberate: bili owns the only irreversible work (rows and blobs),
   // so it goes first while the batch dir is still empty; the caches at the end
   // are cheap, idempotent and report-only by default.
@@ -207,7 +208,10 @@ export function apply(ctx: HostContext, config?: unknown): () => void {
 
   const attempt = async (sessionId: string, round: number): Promise<void> => {
     try {
-      const current = await store();
+      // Never the cached snapshot here: the session being deleted is exactly the
+      // one the boot snapshot still lists, so a cached answer makes every retry
+      // conclude "alive" and skip the cleanup (Codex P1, PR #8).
+      const current = await storeCache.fresh();
       if (current.has(sessionId)) {
         // A delete can emit while the store still lists the session; retry a
         // couple of times before believing the session is gone.
@@ -301,6 +305,12 @@ export function apply(ctx: HostContext, config?: unknown): () => void {
     }
     if (cfg.autoPurgeOrphans) {
       for (const orphan of orphans) {
+        // Snapshot ids are whatever bili wrote; only real DSH session ids may be
+        // auto-deleted. Everything else is reported and left alone (Codex, PR #8).
+        if (!isSessionId(orphan.id)) {
+          await logLine(`skip orphan ${orphan.id}: not a DSH session id`);
+          continue;
+        }
         await purgeFamily(familyOf(orphan.id, childrenOf(orphan.id)), {
           cfg,
           logger,

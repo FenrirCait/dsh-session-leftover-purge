@@ -244,6 +244,16 @@ export async function writeGhostKv(
   const removed: Record<string, number> = {};
   db.exec('BEGIN IMMEDIATE');
   try {
+    // Re-check inside the write lock: bili's lane rewrites these blobs from
+    // memory on every request, and writing a value planned before that rewrite
+    // would resurrect stale bindings (Codex, PR #8 and PR #4).
+    const read = db.prepare('SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?');
+    for (const entry of scan.entries) {
+      const now = read.get(entry.target.namespace, entry.target.key) as KvRow | undefined;
+      if (String(now?.value_json ?? '') !== entry.before) {
+        throw new Error(`changed-during-write:${entry.target.namespace}/${entry.target.key}`);
+      }
+    }
     for (const entry of scan.entries) {
       if (hasUpdatedAt) update.run(entry.next, Date.now(), entry.target.namespace, entry.target.key);
       else update.run(entry.next, entry.target.namespace, entry.target.key);

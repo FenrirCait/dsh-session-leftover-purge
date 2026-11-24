@@ -43,4 +43,6 @@ export declare function restoreLatest(logger?: Logger): Promise<{
     database?: string;
     ledger?: string;
     costFiles?: number;
+    kv?: string;
+    caches?: number;
 }>;
