@@ -1,6 +1,5 @@
 # 依赖
 node_modules/
-pnpm-lock.yaml
 
 # 运行时产物（插件自己的状态目录，不在仓库里）
 trash/
