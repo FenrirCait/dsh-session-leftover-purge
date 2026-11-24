@@ -57,12 +57,22 @@ test('sqlite backend with a renamed table still resolves via column discovery', 
   assert.equal(store.has(PARENT), true);
 });
 
-test('an unreadable backend answers "alive" for everything', async () => {
-  const root = tmp('unknown');
+test('a missing session root is unknown and answers alive for everything', async () => {
+  const root = path.join(tmp('unknown'), 'does-not-exist');
   const store = await loadSessionStore(root);
   assert.equal(store.probe().kind, 'unknown');
   assert.equal(store.liveIds(), null);
   assert.equal(store.has('session-anything'), true);
+});
+
+test('an existing but empty root is authoritative: nothing is alive', async () => {
+  // This is what the last deleted session leaves behind. Calling it `unknown`
+  // would make the final purge of a machine skip forever.
+  const root = tmp('empty');
+  const store = await loadSessionStore(root);
+  assert.equal(store.probe().kind, 'jsonl');
+  assert.deepEqual([...(store.liveIds() ?? [])], []);
+  assert.equal(store.has('session-anything'), false);
 });
 
 test('a sessions.sqlite without a session registry is unknown, not empty', async () => {

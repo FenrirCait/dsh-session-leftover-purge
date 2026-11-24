@@ -20,24 +20,33 @@ import { dshSessionsRoot } from '../runtime/paths.js';
  */
 const ID_COLUMNS = ['session_id', 'sessionId', 'id'];
 
-function listDirs(dir: string): fs.Dirent[] {
-  try {
-    return fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-}
-
-/** Session ids under `<root>/<project>/<session>` (jsonl backend). */
-function jsonlSessionIds(root: string): Set<string> {
+/**
+ * Session ids under `<root>/<project>/<session>`, plus whether the scan was
+ * complete. A workspace that cannot be read makes the whole list untrustworthy:
+ * dropping just that workspace would make its live sessions look deleted, and a
+ * default-on sweep would then remove their bindings (Codex, PR #4).
+ */
+function scanJsonlSessions(root: string): { ids: Set<string>; incomplete: boolean; exists: boolean } {
   const ids = new Set<string>();
-  for (const workspace of listDirs(root)) {
+  let workspaces: fs.Dirent[];
+  try {
+    workspaces = fs.readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    // A missing root is "no backend here"; anything else means "cannot tell".
+    return { ids, incomplete: (error as NodeJS.ErrnoException).code !== 'ENOENT', exists: false };
+  }
+  let incomplete = false;
+  for (const workspace of workspaces) {
     if (!workspace.isDirectory()) continue;
-    for (const session of listDirs(path.join(root, workspace.name))) {
-      if (session.isDirectory()) ids.add(session.name);
+    try {
+      for (const session of fs.readdirSync(path.join(root, workspace.name), { withFileTypes: true })) {
+        if (session.isDirectory()) ids.add(session.name);
+      }
+    } catch {
+      incomplete = true;
     }
   }
-  return ids;
+  return { ids, incomplete, exists: true };
 }
 
 interface Tableish {
@@ -137,9 +146,17 @@ export async function loadSessionStore(root: string = dshSessionsRoot()): Promis
     }
     return storeOf({ kind: 'sqlite', root, evidence: `${ids.size} session row(s) in ${sqlitePath}` }, ids);
   }
-  const ids = jsonlSessionIds(root);
-  if (ids.size > 0) {
-    return storeOf({ kind: 'jsonl', root, evidence: `${ids.size} session dir(s) under ${root}` }, ids);
+  const scan = scanJsonlSessions(root);
+  if (scan.incomplete) {
+    return unknownStore(root, `session scan incomplete under ${root} (an unreadable workspace)`);
   }
-  return unknownStore(root, `no sessions.sqlite and no session dirs under ${root}`);
+  if (!scan.exists) {
+    // No jsonl root and no sessions.sqlite: a fresh or foreign layout. Do not
+    // claim "every session is gone" on the strength of a missing directory.
+    return unknownStore(root, `no sessions.sqlite and no sessions directory at ${root}`);
+  }
+  // An existing, readable root is authoritative even when it is empty: that is
+  // what the last deleted session leaves behind, and calling it `unknown` would
+  // make the final purge of a machine skip forever.
+  return storeOf({ kind: 'jsonl', root, evidence: `${scan.ids.size} session dir(s) under ${root}` }, scan.ids);
 }

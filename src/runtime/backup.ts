@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import type { Logger, PluginConfig } from '../types.js';
-import { biliSessionsRoot, costMeterDetailsRoot, ledgerFile, stateDir } from './paths.js';
+import { archiveProjcacheRoot, biliSessionsRoot, costMeterDetailsRoot, dshContextRoot, ledgerFile, stateDir } from './paths.js';
 
 const DB = 'index.db';
 const SIDECARS = ['', '-wal', '-shm'];
@@ -161,6 +161,84 @@ export async function deleteAllBatches(logger?: Logger): Promise<{ removed: numb
   return { removed, failed };
 }
 
+/** Copy every file under `from` into `toRoot`, preserving relative paths. */
+async function restoreTree(from: string, toRoot: string): Promise<number> {
+  if (!fs.existsSync(from)) return 0;
+  let count = 0;
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      const rel = path.relative(from, full);
+      const target = path.join(toRoot, rel);
+      await fs.promises.mkdir(path.dirname(target), { recursive: true });
+      await fs.promises.copyFile(full, target);
+      count += 1;
+    }
+  };
+  await walk(from);
+  return count;
+}
+
+/**
+ * Put the `kv_store` rows back.
+ *
+ * This is what makes a sweep-only batch restorable: its only member is
+ * `kv-store.json.bak`, and a restore used to pick that batch, restore nothing,
+ * and never fall through to an older purge (Codex, PR #4).
+ */
+async function restoreKv(file: string): Promise<string> {
+  let sqlite: typeof import('node:sqlite');
+  try {
+    sqlite = await import('node:sqlite');
+  } catch {
+    return 'failed:sqlite-unavailable';
+  }
+  let rows: Array<{ namespace?: unknown; key?: unknown; value_json?: unknown }>;
+  try {
+    rows = JSON.parse(await fs.promises.readFile(file, 'utf8')) as typeof rows;
+  } catch (error) {
+    return `failed:${String(error)}`;
+  }
+  const dbFile = path.join(biliSessionsRoot(), DB);
+  if (!fs.existsSync(dbFile)) return 'skipped:index-missing';
+  if (!(await canTakeWriteLock(dbFile))) {
+    const staged = path.join(biliSessionsRoot(), `kv-store.restored-${stamp()}.json.bak`);
+    await fs.promises.copyFile(file, staged);
+    return `staged:${path.basename(staged)}`;
+  }
+  let db: import('node:sqlite').DatabaseSync | undefined;
+  try {
+    db = new sqlite.DatabaseSync(dbFile);
+    const exec = (sql: string): void => (db as unknown as { exec(sql: string): void }).exec(sql);
+    exec('PRAGMA busy_timeout = 4000');
+    exec('BEGIN IMMEDIATE');
+    const stmt = db.prepare('UPDATE kv_store SET value_json = ?, updated_at = ? WHERE namespace = ? AND key = ?');
+    for (const row of rows) {
+      if (typeof row.namespace !== 'string' || typeof row.key !== 'string') continue;
+      stmt.run(String(row.value_json ?? ''), Date.now(), row.namespace, row.key);
+    }
+    exec('COMMIT');
+    return 'applied';
+  } catch (error) {
+    try {
+      (db as unknown as { exec(sql: string): void }).exec('ROLLBACK');
+    } catch {
+      /* the transaction may already be gone */
+    }
+    return `failed:${String(error)}`;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
 /** Snapshot destination: the protocol directory that already holds this name. */
 function snapshotDestination(fileName: string): string {
   const bare = fileName.includes('__') ? fileName.slice(fileName.indexOf('__') + 2) : fileName;
@@ -216,6 +294,8 @@ export async function restoreLatest(logger?: Logger): Promise<{
   database?: string;
   ledger?: string;
   costFiles?: number;
+  kv?: string;
+  caches?: number;
 }> {
   const batches = listBatches();
   const batch = batches[0];
@@ -252,6 +332,19 @@ export async function restoreLatest(logger?: Logger): Promise<{
         }
         database = 'applied';
       } catch (error) {
+        // A failed restore must not leave the index missing: put every aside
+        // file back where it was (Codex, PR #8).
+        for (const suffix of SIDECARS) {
+          const live = `${target}${suffix}`;
+          const aside = `${live}.before-restore-${tag}`;
+          if (fs.existsSync(aside) && !fs.existsSync(live)) {
+            try {
+              await fs.promises.rename(aside, live);
+            } catch {
+              /* leave the aside for manual recovery */
+            }
+          }
+        }
         database = `failed:${String(error)}`;
       }
     } else {
@@ -279,6 +372,15 @@ export async function restoreLatest(logger?: Logger): Promise<{
         await fs.promises.copyFile(ledgerCopy, target);
         ledger = 'applied';
       } catch (error) {
+        // Same rule as the database: a failed copy puts the original back.
+        const aside = `${target}.before-restore-${tag}`;
+        if (fs.existsSync(aside) && !fs.existsSync(target)) {
+          try {
+            await fs.promises.rename(aside, target);
+          } catch {
+            /* leave the aside for manual recovery */
+          }
+        }
         ledger = `failed:${String(error)}`;
       }
     }
@@ -304,9 +406,25 @@ export async function restoreLatest(logger?: Logger): Promise<{
     await walk(costDir);
   }
 
-  await logLine(`restore batch=${batch.name} snapshots=${snapshots} db=${database} ledger=${ledger} costFiles=${costFiles}`);
-  logger?.info(
-    `session-leftover-purge: restore ${batch.name} → snapshots=${snapshots} db=${database} ledger=${ledger} cost-files=${costFiles}`,
+  let kv = 'skipped';
+  const kvCopy = path.join(batch.dir, 'kv-store.json.bak');
+  if (fs.existsSync(kvCopy)) kv = await restoreKv(kvCopy);
+
+  let caches = 0;
+  try {
+    caches += await restoreTree(path.join(batch.dir, 'cache'), path.join(dshContextRoot(), 'overview-cache.v3'));
+    caches += await restoreTree(path.join(batch.dir, 'projcache'), archiveProjcacheRoot());
+  } catch (error) {
+    logger?.warn(`session-leftover-purge: cannot restore cache backups: ${String(error)}`);
+  }
+
+  await logLine(
+    `restore batch=${batch.name} snapshots=${snapshots} db=${database} ledger=${ledger} ` +
+      `kv=${kv} caches=${caches} costFiles=${costFiles}`,
   );
-  return { ok: true, batch: batch.name, snapshots, database, ledger, costFiles };
+  logger?.info(
+    `session-leftover-purge: restore ${batch.name} → snapshots=${snapshots} db=${database} ledger=${ledger} ` +
+      `kv=${kv} caches=${caches} cost-files=${costFiles}`,
+  );
+  return { ok: true, batch: batch.name, snapshots, database, ledger, costFiles, kv, caches };
 }
