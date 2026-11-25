@@ -13,7 +13,7 @@ import { familyOf, isSessionId, subagentParentOf } from './core/family.js';
 import { createStoreCache } from './runtime/store-cache.js';
 import { findOrphanFamilies, purgeFamily } from './runtime/execute.js';
 import type { FamilyRun } from './runtime/execute.js';
-import { applyPendingKvRestore, deleteAllBatches, logLine, restoreLatest, sweepTrash } from './runtime/backup.js';
+import { applyPendingKvRestoreSync, deleteAllBatches, logLine, restoreLatest, sweepTrash } from './runtime/backup.js';
 import { biliSessionsRoot, dshSessionsRoot, ledgerFile, stateDir, trashDir } from './runtime/paths.js';
 import type { Adapter, Logger, PluginConfig, SessionStore } from './types.js';
 
@@ -357,17 +357,16 @@ export function apply(ctx: HostContext, config?: unknown): () => void {
   }, bootDelay);
   bootTimer.unref?.();
 
-  // A kv restore requested while bili's lane was running can be overwritten by
-  // the lane's next request. The marker it leaves is re-applied here, before the
-  // lane can start (Codex, PR #10).
-  void (async () => {
-    try {
-      const pending = await applyPendingKvRestore();
-      if (pending !== 'none') logger.info(`session-leftover-purge: pending kv restore → ${pending}`);
-    } catch (error) {
-      logger.warn(`session-leftover-purge: pending kv restore failed: ${String(error)}`);
-    }
-  })();
+  // Synchronous barrier: the host may start bili's lane as soon as this plugin
+  // finishes loading, so a pending kv restore must commit before that. A
+  // fire-and-forget restore could be overwritten by the lane's first request and
+  // then clear its own marker, losing the retry (Codex, PR #11).
+  try {
+    const pending = applyPendingKvRestoreSync();
+    if (pending !== 'none') logger.info(`session-leftover-purge: pending kv restore → ${pending}`);
+  } catch (error) {
+    logger.warn(`session-leftover-purge: pending kv restore failed: ${String(error)}`);
+  }
 
   // Ghost sweep runs before the lane can start, not on the boot timer: bili
   // rewrites the blobs from memory on every request, so boot is the only window
