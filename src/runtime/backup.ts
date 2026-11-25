@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 
 import type { Logger, PluginConfig } from '../types.js';
 import { archiveProjcacheRoot, biliSessionsRoot, costMeterDetailsRoot, dshContextRoot, ledgerFile, stateDir } from './paths.js';
@@ -192,54 +193,186 @@ async function restoreTree(from: string, toRoot: string): Promise<number> {
 /**
  * Put the `kv_store` rows back.
  *
- * This is what makes a sweep-only batch restorable: its only member is
- * `kv-store.json.bak`, and a restore used to pick that batch, restore nothing,
- * and never fall through to an older purge (Codex, PR #4).
+ * A restore is a *merge*, not a whole-blob swap: the user can keep working
+ * between the restore and the next start, and replaying an old blob wholesale
+ * would drop whatever the lane wrote in between (Codex, PR #11). Entries the
+ * backup has and the live blob lacks are added; on a key conflict the entry with
+ * the newer `lastSeen`/`updatedAt` wins. Blobs that are not JSON fall back to a
+ * plain replace, which is what a restore means for them.
+ *
+ * Synchronous on purpose: the boot path calls it before the plugin finishes
+ * loading, and that is the only reliable barrier against bili's lane starting
+ * (Codex, PR #11).
  */
-async function restoreKv(file: string): Promise<string> {
+function mergeKvValue(currentText: string, backupText: string): string | undefined {
+  let current: unknown;
+  let backup: unknown;
+  try {
+    current = JSON.parse(currentText);
+    backup = JSON.parse(backupText);
+  } catch {
+    return undefined; // not JSON: caller replaces it
+  }
+  if (current === null || typeof current !== 'object' || backup === null || typeof backup !== 'object') return undefined;
+
+  const entryKey = (entry: unknown): string => {
+    if (entry === null || typeof entry !== 'object') return '';
+    const record = entry as Record<string, unknown>;
+    const key = record.sessionId ?? record.id ?? record.session;
+    return typeof key === 'string' ? key : '';
+  };
+  const entryTime = (entry: unknown): number => {
+    if (entry === null || typeof entry !== 'object') return 0;
+    const record = entry as Record<string, unknown>;
+    const value = Number(record.lastSeen ?? record.updatedAt ?? 0);
+    return Number.isFinite(value) ? value : 0;
+  };
+
+  const currentEntries = Array.isArray(current) ? current : (current as Record<string, unknown>).entries;
+  const backupEntries = Array.isArray(backup) ? backup : (backup as Record<string, unknown>).entries;
+  if (Array.isArray(currentEntries) && Array.isArray(backupEntries)) {
+    const byKey = new Map<string, unknown>();
+    for (const entry of currentEntries) {
+      const key = entryKey(entry);
+      if (key.length > 0) byKey.set(key, entry);
+    }
+    let changed = false;
+    for (const entry of backupEntries) {
+      const key = entryKey(entry);
+      if (key.length === 0) continue;
+      const live = byKey.get(key);
+      if (live === undefined) {
+        byKey.set(key, entry);
+        changed = true;
+      } else if (entryTime(entry) > entryTime(live)) {
+        byKey.set(key, entry);
+        changed = true;
+      }
+    }
+    if (!changed) return currentText;
+    const merged = Array.isArray(current)
+      ? [...byKey.values()]
+      : { ...(current as Record<string, unknown>), entries: [...byKey.values()] };
+    return JSON.stringify(merged);
+  }
+
+  if (Array.isArray(current) || Array.isArray(backup)) return undefined;
+
+  const currentMap = current as Record<string, unknown>;
+  const backupMap = backup as Record<string, unknown>;
+  const merged: Record<string, unknown> = { ...currentMap };
+  let changed = false;
+  for (const [key, value] of Object.entries(backupMap)) {
+    if (!(key in merged)) {
+      merged[key] = value;
+      changed = true;
+      continue;
+    }
+    const live = merged[key];
+    if (entryTime(value) > entryTime(live)) {
+      merged[key] = value;
+      changed = true;
+    }
+  }
+  return changed ? JSON.stringify(merged) : currentText;
+}
+
+function restoreKv(file: string): string {
   let sqlite: typeof import('node:sqlite');
   try {
-    sqlite = await import('node:sqlite');
+    // A synchronous require keeps the boot path fully synchronous. `node:sqlite`
+    // is a builtin, so this cannot hit the network or a resolution surprise.
+    sqlite = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
   } catch {
     return 'failed:sqlite-unavailable';
   }
   let rows: Array<{ namespace?: unknown; key?: unknown; value_json?: unknown }>;
   try {
-    rows = JSON.parse(await fs.promises.readFile(file, 'utf8')) as typeof rows;
+    rows = JSON.parse(fs.readFileSync(file, 'utf8')) as typeof rows;
   } catch (error) {
     return `failed:${String(error)}`;
   }
   const dbFile = path.join(biliSessionsRoot(), DB);
   if (!fs.existsSync(dbFile)) return 'skipped:index-missing';
-  if (!(await canTakeWriteLock(dbFile))) {
-    const staged = path.join(biliSessionsRoot(), `kv-store.restored-${stamp()}.json.bak`);
-    await fs.promises.copyFile(file, staged);
-    return `staged:${path.basename(staged)}`;
-  }
+
   let db: import('node:sqlite').DatabaseSync | undefined;
   try {
     db = new sqlite.DatabaseSync(dbFile);
     const exec = (sql: string): void => (db as unknown as { exec(sql: string): void }).exec(sql);
-    exec('PRAGMA busy_timeout = 4000');
+    exec('PRAGMA busy_timeout = 2000');
+    try {
+      exec('BEGIN IMMEDIATE');
+    } catch {
+      // Another writer holds the database (the lane, or a purge): stage instead
+      // of pretending, and let the next boot apply it.
+      try {
+        db.close();
+      } catch {
+        /* already closed */
+      }
+      db = undefined;
+      const staged = path.join(biliSessionsRoot(), `kv-store.restored-${stamp()}.json.bak`);
+      fs.copyFileSync(file, staged);
+      return `staged:${path.basename(staged)}`;
+    }
+
     // Older bili schemas have no updated_at; the purge path already tolerates
     // that variant, so the restore must too (Codex, PR #10).
     const columns = (db.prepare('PRAGMA table_info("kv_store")').all() as Array<{ name?: unknown }>)
       .map((row) => row.name)
       .filter((name): name is string => typeof name === 'string');
     if (!columns.includes('namespace') || !columns.includes('key') || !columns.includes('value_json')) {
+      exec('ROLLBACK');
       return 'skipped:kv_store-missing';
     }
     const hasUpdatedAt = columns.includes('updated_at');
-    exec('BEGIN IMMEDIATE');
-    const stmt = hasUpdatedAt
+    const read = db.prepare('SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?');
+    const update = hasUpdatedAt
       ? db.prepare('UPDATE kv_store SET value_json = ?, updated_at = ? WHERE namespace = ? AND key = ?')
       : db.prepare('UPDATE kv_store SET value_json = ? WHERE namespace = ? AND key = ?');
+    const insert = hasUpdatedAt
+      ? db.prepare('INSERT INTO kv_store (namespace, key, value_json, updated_at) VALUES (?, ?, ?, ?)')
+      : db.prepare('INSERT INTO kv_store (namespace, key, value_json) VALUES (?, ?, ?)');
+
+    let changed = false;
     for (const row of rows) {
       if (typeof row.namespace !== 'string' || typeof row.key !== 'string') continue;
-      if (hasUpdatedAt) stmt.run(String(row.value_json ?? ''), Date.now(), row.namespace, row.key);
-      else stmt.run(String(row.value_json ?? ''), row.namespace, row.key);
+      const backupText = String(row.value_json ?? '');
+      const live = read.get(row.namespace, row.key) as { value_json?: unknown } | undefined;
+      if (live === undefined) {
+        if (hasUpdatedAt) insert.run(row.namespace, row.key, backupText, Date.now());
+        else insert.run(row.namespace, row.key, backupText);
+        changed = true;
+        continue;
+      }
+      const liveText = String(live.value_json ?? '');
+      const merged = mergeKvValue(liveText, backupText);
+      let next: string;
+      if (merged === undefined) {
+        // Not JSON we understand: a restore replaces the row.
+        if (liveText === backupText) continue;
+        next = backupText;
+      } else {
+        if (merged === liveText) continue;
+        next = merged;
+      }
+      if (hasUpdatedAt) update.run(next, Date.now(), row.namespace, row.key);
+      else update.run(next, row.namespace, row.key);
+      changed = true;
     }
     exec('COMMIT');
+
+    if (changed) {
+      // Remember the rows for the next boot: the lane rewrites these blobs from
+      // memory, so what we just wrote can be undone by its next request.
+      try {
+        fs.writeFileSync(path.join(biliSessionsRoot(), PENDING_KV), JSON.stringify(rows));
+      } catch {
+        /* the restore itself succeeded; a missing marker only costs the retry */
+      }
+      return 'applied';
+    }
+    return 'noop';
   } catch (error) {
     try {
       (db as unknown as { exec(sql: string): void }).exec('ROLLBACK');
@@ -254,34 +387,31 @@ async function restoreKv(file: string): Promise<string> {
       /* already closed */
     }
   }
-  // Keep a copy for the boot pass: bili's lane rewrites these blobs from memory,
-  // so a restore that lands while it runs can be undone by its next request.
-  // The next start applies it again before the lane exists (Codex, PR #10).
-  try {
-    await fs.promises.writeFile(path.join(biliSessionsRoot(), PENDING_KV), JSON.stringify(rows));
-  } catch {
-    /* the restore itself succeeded; a missing marker only costs the retry */
-  }
-  return 'applied';
 }
 
 /**
- * Re-apply a kv restore at boot, before bili's lane can start.
- * Returns `none` when there is nothing pending.
+ * Re-apply a kv restore at boot, **synchronously**, before the plugin finishes
+ * loading: after that point the host may start bili's lane at any moment, and a
+ * fire-and-forget restore can be overwritten before it commits (Codex, PR #11).
  */
-export async function applyPendingKvRestore(): Promise<string> {
+export function applyPendingKvRestoreSync(): string {
   const marker = path.join(biliSessionsRoot(), PENDING_KV);
   if (!fs.existsSync(marker)) return 'none';
-  const result = await restoreKv(marker);
-  if (result === 'applied') {
+  const result = restoreKv(marker);
+  if (result === 'applied' || result === 'noop') {
     try {
-      await fs.promises.rm(marker, { force: true });
+      fs.rmSync(marker, { force: true });
     } catch {
       /* nothing to clean up */
     }
-    await logLine('apply-pending-kv applied');
+    void logLine(`apply-pending-kv ${result}`);
   }
   return result;
+}
+
+/** Async wrapper for callers that already live in a promise chain. */
+export async function applyPendingKvRestore(): Promise<string> {
+  return applyPendingKvRestoreSync();
 }
 
 /**
@@ -462,7 +592,7 @@ export async function restoreLatest(logger?: Logger): Promise<{
 
   let kv = 'skipped';
   const kvCopy = path.join(batch.dir, 'kv-store.json.bak');
-  if (fs.existsSync(kvCopy)) kv = await restoreKv(kvCopy);
+  if (fs.existsSync(kvCopy)) kv = restoreKv(kvCopy);
 
   let caches = 0;
   try {

@@ -29,9 +29,12 @@ export declare function deleteAllBatches(logger?: Logger): Promise<{
     failed: string[];
 }>;
 /**
- * Re-apply a kv restore at boot, before bili's lane can start.
- * Returns `none` when there is nothing pending.
+ * Re-apply a kv restore at boot, **synchronously**, before the plugin finishes
+ * loading: after that point the host may start bili's lane at any moment, and a
+ * fire-and-forget restore can be overwritten before it commits (Codex, PR #11).
  */
+export declare function applyPendingKvRestoreSync(): string;
+/** Async wrapper for callers that already live in a promise chain. */
 export declare function applyPendingKvRestore(): Promise<string>;
 /**
  * Put renamed-aside files back. The target may be a *partial* copy left by a

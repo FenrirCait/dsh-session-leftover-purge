@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { applyPendingKvRestore, restoreAsides, restoreLatest } from '../lib/runtime/backup.js';
+import { applyPendingKvRestore, applyPendingKvRestoreSync, restoreAsides, restoreLatest } from '../lib/runtime/backup.js';
 
 const SESSION = 'session-11111111-2222-3333-4444-555555555555';
 const QUIET = { info() {}, warn() {} };
@@ -59,10 +59,58 @@ test('the restore leaves a marker that boot re-applies, then clears', async () =
   const marker = path.join(bili, 'kv-store.restored-pending.bak');
   assert.equal(fs.existsSync(marker), true);
 
+  // The rows are already in place, so the replay is a no-op merge — but it must
+  // still clear the marker (nothing left to protect).
   const applied = await applyPendingKvRestore();
-  assert.equal(applied, 'applied');
+  assert.equal(applied, 'noop');
   assert.equal(fs.existsSync(marker), false);
   assert.equal(await applyPendingKvRestore(), 'none');
+});
+
+test('the boot replay is synchronous, and merges instead of overwriting', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-merge-'));
+  const home = path.join(root, 'home');
+  const bili = path.join(root, 'bili');
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(bili, { recursive: true });
+  process.env.DSH_HOME = home;
+  process.env.BILI_SESSIONS_DIR = bili;
+
+  const db = new DatabaseSync(path.join(bili, 'index.db'));
+  db.exec('CREATE TABLE kv_store (namespace TEXT, key TEXT, value_json TEXT, updated_at INTEGER)');
+  const live = JSON.stringify({
+    'session-a': { sessionId: 'session-a', lastSeen: 3 },
+    'session-c': { sessionId: 'session-c', lastSeen: 9 },
+  });
+  db.prepare('INSERT INTO kv_store VALUES (?, ?, ?, ?)').run('plugin-conversations', 'table', live, 1);
+  db.close();
+
+  // The marker holds an older snapshot: a is older there, b is missing live.
+  const marker = path.join(bili, 'kv-store.restored-pending.bak');
+  fs.writeFileSync(
+    marker,
+    JSON.stringify([
+      {
+        namespace: 'plugin-conversations',
+        key: 'table',
+        value_json: JSON.stringify({
+          'session-a': { sessionId: 'session-a', lastSeen: 7 },
+          'session-b': { sessionId: 'session-b', lastSeen: 2 },
+        }),
+      },
+    ]),
+  );
+
+  const result = applyPendingKvRestoreSync();
+  assert.equal(result, 'applied');
+
+  const check = new DatabaseSync(path.join(bili, 'index.db'));
+  const merged = JSON.parse(check.prepare('SELECT value_json FROM kv_store').get().value_json);
+  check.close();
+  assert.deepEqual(Object.keys(merged).sort(), ['session-a', 'session-b', 'session-c']);
+  assert.equal(merged['session-a'].lastSeen, 7, 'backup was newer, so it wins');
+  assert.equal(merged['session-c'].lastSeen, 9, 'live entry written after the restore survives');
+  assert.equal(fs.existsSync(marker), false);
 });
 
 test('a partial target does not block the aside rollback', async () => {
